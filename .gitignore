@@ -1,0 +1,6 @@
+.venv
+.idea
+__pycache__/
+tls.crt
+tls.key
+config.yaml
