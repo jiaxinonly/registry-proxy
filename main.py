@@ -186,26 +186,58 @@ async def proxy(path: str, request: Request):
                 timeout=30.0
             )
 
+            # 处理 401 认证
             if (
-                    upstream_resp.status_code == 401
-                    and upstream_resp.headers.get("www-authenticate", "").lower().startswith("bearer ")
+                upstream_resp.status_code == 401
+                and upstream_resp.headers.get("www-authenticate", "").lower().startswith("bearer ")
             ):
                 logger.info("🛡️ [代理] 拦截到 401 认证请求，正在重写 realm")
                 return await handle_401_and_cache_realm(upstream_resp, upstream_host, request)
 
-            if (
-                    upstream_resp.status_code in (301, 302, 303, 307, 308)
-                    and "/blobs/" in full_path
-            ):
+            # 处理 3xx 重定向
+            if upstream_resp.status_code in (301, 302, 303, 307, 308):
                 location = upstream_resp.headers.get("location")
                 if location:
-                    logger.info(f"📦 [代理] 检测到 blob 重定向 → 正通过代理拉取：{location}")
-                    return StreamingResponse(
-                        _stream_blob(location, headers),
-                        status_code=200,
-                        media_type="application/octet-stream"
-                    )
+                    if "/blobs/" in full_path:
+                        # Blob 重定向：流式代理
+                        logger.info(f"📦 [代理] 检测到 blob 重定向 → 正通过代理拉取：{location}")
+                        return StreamingResponse(
+                            _stream_blob(location, headers),
+                            status_code=200,
+                            media_type="application/octet-stream"
+                        )
+                    else:
+                        # Manifest 或其他重定向：由代理代取，返回 200
+                        logger.info(f"🔄 [代理] 拦截非-blob 重定向 → 代理拉取内容：{location}")
+                        redirect_url = httpx.URL(location)
+                        redirect_host = redirect_url.host
+                        cdn_headers = {
+                            "Host": redirect_host,
+                            "User-Agent": headers.get("user-agent", ""),
+                        }
 
+                        async with httpx.AsyncClient() as cdn_client:
+                            try:
+                                cdn_resp = await cdn_client.get(
+                                    location,
+                                    headers=cdn_headers,
+                                    timeout=30.0
+                                )
+                                # 构造干净的响应头
+                                resp_headers = dict(cdn_resp.headers)
+                                resp_headers.pop("content-encoding", None)
+                                resp_headers.pop("transfer-encoding", None)
+                                # 返回实际内容，状态码改为 200
+                                return Response(
+                                    content=cdn_resp.content,
+                                    status_code=200,
+                                    headers=resp_headers
+                                )
+                            except Exception as e:
+                                logger.exception(f"💥 [代理] 拉取重定向目标失败：{location} | 错误: {e}")
+                                return Response(status_code=502, content="Failed to fetch redirected resource")
+
+            # 普通响应（非 401、非 3xx）
             resp_headers = dict(upstream_resp.headers)
             resp_headers.pop("content-encoding", None)
             resp_headers.pop("transfer-encoding", None)
