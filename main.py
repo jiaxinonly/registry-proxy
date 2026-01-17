@@ -5,7 +5,13 @@
 @Date        : 2026/1/10
 @Time        : 17:31
 @Description :
+Docker Registry 反向代理服务：
+- 支持多上游注册表（如 Docker Hub、Harbor 等）
+- 自动拦截 401 认证并重写 realm 到本地 /auth/token 路由
+- 拦截 blob 重定向（3xx）并透明代理下载（避免客户端直连 CDN）
+- 提供健康检查接口
 """
+
 import re
 from typing import AsyncGenerator
 import httpx
@@ -18,31 +24,47 @@ from starlette.datastructures import Headers
 from urllib.parse import urlparse, urljoin
 
 # ======================
-# 加载配置 & 初始化日志
+# 配置加载 & 日志初始化
 # ======================
 settings = Settings()
-logger = setup_logging(settings)  # ← 初始化日志
+logger = setup_logging(settings)  # 初始化结构化日志系统
 
-# 全局变量
+# 全局缓存：存储各 upstream host 对应的原始认证 realm
 REALM_CACHE: dict[str, str] = {}
-app = FastAPI()
+
+# 创建 FastAPI 应用实例
+app = FastAPI(
+    title="Registry Proxy",
+    description="Docker Registry 反向代理网关，支持认证重写与 Blob 透明代理",
+    version="0.0.1"
+)
 
 
 # ======================
-# 工具：流式传输 blob
+# 工具函数：流式代理 Blob 内容（用于处理 CDN 重定向）
 # ======================
 async def _stream_blob(url: str, original_headers: dict) -> AsyncGenerator[bytes, None]:
+    """
+    从给定 URL 流式拉取二进制内容（如 layer/blob），并透传给客户端。
+
+    注意：
+    - 不跟随重定向（由调用方确保 url 是最终 CDN 地址）
+    - 使用 Host 头欺骗以绕过 CDN 的 Host 校验
+    """
     parsed_url = urlparse(url)
     host = parsed_url.hostname
     if not host:
-        raise ValueError("无效的重定向 URL：缺少主机名")
+        error_msg = f"无效的重定向 URL：缺少主机名 | URL={url}"
+        logger.error(f"❌ [BLOB代理] {error_msg}")
+        raise ValueError(error_msg)
 
+    # 构造请求头：关键是要设置正确的 Host 和 User-Agent
     cdn_headers = {
         "Host": host,
-        "User-Agent": original_headers.get("user-agent"),
+        "User-Agent": original_headers.get("user-agent", "registry-proxy/0.0.1"),
     }
 
-    logger.info(f"📥 [BLOB代理] 正在通过代理获取资源：{url} （Host: {host}）")
+    logger.info(f"📥 [BLOB代理] 开始流式拉取资源 → URL: {url} | Host: {host}")
 
     async with httpx.AsyncClient() as client:
         try:
@@ -50,144 +72,182 @@ async def _stream_blob(url: str, original_headers: dict) -> AsyncGenerator[bytes
                     method="GET",
                     url=url,
                     headers=cdn_headers,
-                    follow_redirects=False,
+                    follow_redirects=False,  # 不再重定向（应已是最终地址）
                     timeout=60.0
             ) as resp:
                 if resp.status_code != 200:
                     error_content = await resp.aread()
+                    error_detail = error_content.decode('utf-8', errors='ignore')[:500]  # 截断防日志爆炸
                     logger.error(
-                        f"❌ [BLOB代理] CDN 返回非 200 状态码：{resp.status_code}，"
-                        f"URL: {url}，响应内容：{error_content.decode('utf-8', errors='ignore')}"
+                        f"❌ [BLOB代理] CDN 返回非 200 状态码 → "
+                        f"Status: {resp.status_code} | URL: {url} | 响应片段: {error_detail}"
                     )
-                    raise RuntimeError(f"从 CDN 获取 blob 失败：{resp.status_code}")
+                    raise RuntimeError(f"CDN 返回错误状态码: {resp.status_code}")
 
+                chunk_count = 0
                 async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
                     yield chunk
+                    chunk_count += 1
+                    if chunk_count % 100 == 0:  # 每 6.4MB 打一条 debug 日志
+                        logger.debug(f"📦 [BLOB代理] 已传输 {chunk_count * 64} KB 数据")
 
         except Exception as e:
-            logger.exception(f"💥 [BLOB代理] 从 {url} 流式传输 blob 时发生错误：{e}")
+            logger.exception(f"💥 [BLOB代理] 流式传输失败 → URL: {url} | 错误: {e}")
             raise
 
 
 # ======================
-# 处理 401 认证
+# 认证处理：拦截 401 并重写 WWW-Authenticate 中的 realm
 # ======================
 async def handle_401_and_cache_realm(
         upstream_resp: httpx.Response,
         upstream_host: str,
         original_request: Request
 ) -> Response:
+    """
+    处理来自上游注册表的 401 响应：
+    1. 提取原始 realm
+    2. 缓存到 REALM_CACHE（按 upstream_host 索引）
+    3. 将 realm 重写为本地 /auth/token 路径
+    4. 返回修改后的 401 响应给客户端
+    """
     www_auth = upstream_resp.headers.get("www-authenticate", "")
     match = re.search(r'realm="([^"]+)"', www_auth)
     if not match:
-        logger.warning("⚠️ [认证] WWW-Authenticate 头中缺少 realm 字段")
+        logger.warning("⚠️ [认证] WWW-Authenticate 头中未找到 realm 字段 → 跳过重写")
         return Response(status_code=401, headers={"www-authenticate": www_auth})
 
     original_realm = match.group(1)
     if upstream_host not in REALM_CACHE:
         REALM_CACHE[upstream_host] = original_realm
-        logger.info(f"🔑 [认证] 已缓存上游主机 {upstream_host} 的 realm：{original_realm}")
+        logger.info(f"🔑 [认证] 首次缓存 upstream host '{upstream_host}' 的 realm: {original_realm}")
 
+    # 获取当前代理域名（用于构造新的 realm）
     current_host = original_request.headers.get("host", "").split(":")[0]
     new_realm = f"https://{current_host}/auth/token"
+
+    # 替换原始 realm 为本地 token 接口
     new_www_auth = www_auth.replace(original_realm, new_realm)
-    logger.info(f"🔄 [认证] 已重写 realm 为：{new_realm}")
+    logger.info(f"🔄 [认证] 成功重写 realm → 原始: {original_realm} → 新: {new_realm}")
+
     return Response(status_code=401, headers={"www-authenticate": new_www_auth})
 
 
+# ======================
+# 请求头处理：合并重复头 + 设置 Host
+# ======================
 async def handle_request_headers(request_headers: Headers, host: str) -> dict[str, str]:
     """
-    处理请求头：
-      - 替换 Host；
-      - 合并重复的 header 字段（用逗号连接）；
-      - 返回标准 dict[str, str] 格式的 headers。
+    将 Starlette 的 Headers 转换为标准 dict，并：
+    - 合并重复的 header（如多个 Cookie）→ 用逗号连接（符合 RFC）
+    - 强制设置 Host 头为目标 upstream 的主机名
+    - 所有 header key 转为小写（HTTP 规范不区分大小写）
     """
-    header: dict[str, str] = {}
+    header_dict: dict[str, str] = {}
 
-    # 遍历所有原始头（包括重复键）
     for key, value in request_headers.raw:
-        key_str = key.decode("latin-1").lower()  # HTTP 头不区分大小写，通常转小写处理
+        key_str = key.decode("latin-1").lower()
         val_str = value.decode("latin-1")
-        if key_str not in header:
-            header[key_str] = val_str
+        if key_str == "host":
+            # 去除host让请求自动添加
+            continue
+        elif key_str in header_dict:
+            header_dict[key_str] = f"{header_dict[key_str]},{val_str}"
         else:
-            header[key_str] = f"{header[key_str]},{val_str}"
-    # 设置新的 Host 头
-    header["host"] = host
-    return header
-
+            header_dict[key_str] = val_str
+    return header_dict
 
 
 # ======================
-# 健康检查
+# 健康检查端点
 # ======================
-@app.get("/healthz", response_model=HealthCheckResponse)
+@app.get("/healthz", response_model=HealthCheckResponse, summary="健康检查")
 async def health_check():
-    logger.debug("🩺 [健康检查] 收到健康探测请求")
+    """返回服务运行状态，用于 K8s/Liveness Probe"""
+    logger.debug("🩺 [健康检查] 收到探测请求")
     return HealthCheckResponse(status="ok", message="registry-proxy is running", version="0.0.1")
 
 
 # ======================
-# 认证路由
+# 认证令牌代理端点：/auth/token
 # ======================
-@app.get("/auth/token")
+@app.get("/auth/token", summary="代理认证请求到上游")
 async def auth_token(request: Request):
-    # 👇 从 Host 头获取当前代理域名
+    """
+    客户端在收到 401 后会请求此接口获取 token。
+    本服务将：
+    1. 根据 Host 头确定目标 upstream
+    2. 从 REALM_CACHE 获取原始认证地址
+    3. 代理请求（保留 query 参数如 service/scope）
+    4. 返回上游响应（移除 content-encoding 防止 FastAPI 二次压缩）
+    """
     host_header = request.headers.get("host", "")
     proxy_domain = host_header.split(":")[0]
 
-    # 根据 proxy_domain 找到对应的 upstream host（用于查 REALM_CACHE）
     if proxy_domain not in settings.upstreams:
-        logger.error(f"❓ [认证] 未知的代理域名：{proxy_domain}")
-        return Response(status_code=400, content="未知的registry-proxy域名")
+        logger.error(f"❓ [认证] 收到未知代理域名请求 → Host: {proxy_domain}")
+        return Response(status_code=400, content="未知的 registry-proxy 域名")
 
-    # 获取 upstream_base 的主机名（例如 registry-1.docker.io）
     upstream_base = settings.upstreams[proxy_domain]
     upstream_host = httpx.URL(upstream_base).host
 
     original_realm = REALM_CACHE.get(upstream_host)
     if not original_realm:
-        logger.error(f"❓ [认证] 尚未缓存 upstream_host '{upstream_host}' 的 realm（请先触发一次 /v2/ 请求）")
+        logger.error(
+            f"❓ [认证] realm 未就绪 → upstream_host: '{upstream_host}'。"
+            "请先发起一次 /v2/ 请求以触发 401 并缓存 realm"
+        )
         return Response(status_code=400, content="Realm 未就绪，请重试")
 
-    # 构造目标 URL：保留原始 query（service, scope 等）
+    # 保留原始 query 参数（如 ?service=registry.docker.io&scope=...）
     query = str(request.url.query)
     target_url = original_realm
     if query:
-        target_url += ("&" if "?" in original_realm else "?") + query
+        separator = "&" if "?" in original_realm else "?"
+        target_url += separator + query
 
-    logger.info(f"🔐 [认证] 正在代理请求至：{target_url}")
+    logger.info(f"🔐 [认证] 代理请求至上游认证服务 → {target_url}")
 
     async with httpx.AsyncClient() as client:
         try:
             headers = await handle_request_headers(request.headers, upstream_host)
-            resp = await client.get(
-                target_url,
-                headers=headers,
-            )
-            logger.info(f"✅ [认证] 上游服务返回状态码：{resp.status_code}")
-            resp.headers.pop("content-encoding", None)  # 移除 gzip 压缩头标识
+            resp = await client.get(target_url, headers=headers, timeout=15.0)
+
+            # 移除 content-encoding，防止 FastAPI 误判为已压缩内容
+            clean_headers = dict(resp.headers)
+            clean_headers.pop("content-encoding", None)
+
+            logger.info(f"✅ [认证] 上游返回状态码: {resp.status_code}")
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                headers=dict(resp.headers)
+                headers=clean_headers
             )
         except Exception as e:
-            logger.exception("🚨 [认证] 代理请求失败")
+            logger.exception("🚨 [认证] 代理请求失败 → 检查网络或上游服务可用性")
             return Response(status_code=502, content="认证服务不可达")
 
 
 # ======================
-# 主代理路由
+# 主代理路由：/v2/{path}
 # ======================
-@app.api_route("/v2/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
+@app.api_route("/v2/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], summary="主代理入口")
 async def proxy(path: str, request: Request):
+    """
+    核心代理逻辑：
+    - 根据 Host 头路由到不同 upstream
+    - 处理 401（重写 realm）
+    - 处理 3xx 重定向：
+        - 若路径含 /blobs/ → 流式代理（StreamingResponse）
+        - 否则 → 代取内容并返回 200（隐藏重定向）
+    - 其他响应直接透传
+    """
     host_header = request.headers.get("host", "")
     domain = host_header.split(":")[0]
     full_path = f"/v2/{path}"
 
     if domain not in settings.upstreams:
-        logger.warning(f"🌐 [代理] 未知的请求域名：{domain}")
+        logger.warning(f"🌐 [代理] 收到未知域名请求 → Host: {domain}")
         return Response(status_code=400, content="未知的注册表域名")
 
     upstream_base = settings.upstreams[domain]
@@ -195,7 +255,6 @@ async def proxy(path: str, request: Request):
     upstream_host = target_url.host
 
     headers = await handle_request_headers(request.headers, upstream_host)
-
     logger.info(f"➡️ [代理] {request.method} {full_path} → {target_url}")
 
     async with httpx.AsyncClient() as client:
@@ -208,80 +267,86 @@ async def proxy(path: str, request: Request):
                 timeout=30.0
             )
 
-            # 处理 401 认证
+            # === 情况1: 401 认证响应 ===
             if (
-                upstream_resp.status_code == 401
-                and upstream_resp.headers.get("www-authenticate", "").lower().startswith("bearer ")
+                    upstream_resp.status_code == 401
+                    and upstream_resp.headers.get("www-authenticate", "").lower().startswith("bearer ")
             ):
-                logger.info("🛡️ [代理] 拦截到 401 认证请求，正在重写 realm")
+                logger.info("🛡️ [代理] 拦截到 Bearer 认证请求 → 准备重写 realm")
                 return await handle_401_and_cache_realm(upstream_resp, upstream_host, request)
 
-            # 处理 3xx 重定向
+            # === 情况2: 3xx 重定向 ===
             if upstream_resp.status_code in (301, 302, 303, 307, 308):
-                logger.exception(f"响应头 {upstream_resp.headers}")
                 location = upstream_resp.headers.get("location")
-                location = urljoin(str(target_url), location)
-                logger.info(f"🔗 [代理] 解析后的重定向目标: {location}")
-                if location:
-                    if "/blobs/" in full_path:
-                        # Blob 重定向：流式代理
-                        logger.info(f"📦 [代理] 检测到 blob 重定向 → 正通过代理拉取：{location}")
-                        return StreamingResponse(
-                            _stream_blob(location, headers),
-                            status_code=200,
-                            media_type="application/octet-stream"
-                        )
-                    else:
-                        # Manifest 或其他重定向：由代理代取，返回 200
-                        logger.info(f"🔄 [代理] 拦截非-blob 重定向 → 代理拉取内容：{location}")
-                        redirect_url = httpx.URL(location)
-                        redirect_host = redirect_url.host
-                        cdn_headers = {
-                            "Host": redirect_host,
-                            "User-Agent": headers.get("user-agent", ""),
-                        }
+                if not location:
+                    logger.error("🔗 [代理] 3xx 响应缺少 Location 头 → 返回原响应")
+                    return Response(status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
-                        async with httpx.AsyncClient() as cdn_client:
-                            try:
-                                cdn_resp = await cdn_client.get(
-                                    location,
-                                    headers=cdn_headers,
-                                    timeout=30.0
-                                )
-                                # 构造干净的响应头
-                                resp_headers = dict(cdn_resp.headers)
+                # 解析绝对 URL（处理相对重定向）
+                resolved_location = urljoin(str(target_url), location)
+                logger.info(f"🔗 [代理] 原始重定向: {location} → 解析后: {resolved_location}")
 
-                                # 返回实际内容，状态码改为 200
-                                return Response(
-                                    content=cdn_resp.content,
-                                    status_code=200,
-                                    headers=resp_headers
-                                )
-                            except Exception as e:
-                                logger.exception(f"💥 [代理] 拉取重定向目标失败：{location} | 错误: {e}")
-                                return Response(status_code=502, content="Failed to fetch redirected resource")
+                # 判断是否为 blob 请求（关键！避免客户端直连 CDN）
+                if "/blobs/" in full_path:
+                    logger.info("📦 [代理] 检测到 blob 重定向 → 启动流式代理")
+                    return StreamingResponse(
+                        _stream_blob(resolved_location, headers),
+                        status_code=200,
+                        media_type="application/octet-stream"
+                    )
+                else:
+                    # Manifest 或 tag 列表等 → 代取内容，隐藏重定向
+                    logger.info("🔄 [代理] 拦截非-blob 重定向 → 代取内容并返回 200")
+                    redirect_url = httpx.URL(resolved_location)
+                    redirect_host = redirect_url.host
 
-            # 普通响应（非 401、非 3xx）
-            resp_headers = dict(upstream_resp.headers)
-            resp_headers.pop("content-encoding", None)  # 移除 gzip 压缩头标识
+                    cdn_headers = {
+                        "Host": redirect_host,
+                        "User-Agent": headers.get("user-agent", "registry-proxy/0.0.1"),
+                    }
 
-            logger.debug(f"📡 [代理] 上游响应状态码：{upstream_resp.status_code}")
+                    async with httpx.AsyncClient() as cdn_client:
+                        try:
+                            cdn_resp = await cdn_client.get(
+                                resolved_location,
+                                headers=cdn_headers,
+                                timeout=30.0
+                            )
+                            clean_headers = dict(cdn_resp.headers)
+                            clean_headers.pop("content-encoding", None)
+                            return Response(
+                                content=cdn_resp.content,
+                                status_code=200,  # 隐藏 3xx，返回 200
+                                headers=clean_headers
+                            )
+                        except Exception as e:
+                            logger.exception(f"💥 [代理] 拉取重定向目标失败 → URL: {resolved_location}")
+                            return Response(status_code=502, content="Failed to fetch redirected resource")
+
+            # === 情况3: 普通响应（2xx/4xx/5xx）===
+            clean_headers = dict(upstream_resp.headers)
+            clean_headers.pop("content-encoding", None)  # 防止 FastAPI 二次解压
+
+            logger.debug(f"📡 [代理] 上游响应 → Status: {upstream_resp.status_code}")
             return Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
-                headers=resp_headers
+                headers=clean_headers
             )
 
         except Exception as e:
-            logger.exception(f"🔥 [代理] 代理请求到 {target_url} 时失败")
+            logger.exception(f"🔥 [代理] 请求上游失败 → Target: {target_url}")
             return Response(status_code=502, content="网关错误（Bad Gateway）")
 
 
 # ======================
-# 启动入口
+# 应用启动入口
 # ======================
 if __name__ == "__main__":
     import uvicorn
+
+    # 打印配置摘要
+
 
     logger.info("📚 已加载的上游注册表映射：")
     for domain, url in settings.upstreams.items():
@@ -295,9 +360,9 @@ if __name__ == "__main__":
             "ssl_certfile": settings.https.cert,
             "ssl_keyfile": settings.https.key
         }
-        logger.info(f"🔒 正在启动 HTTPS 代理：https://{settings.listen.host}:{settings.listen.port}")
+        logger.info(f"🔒 启动 HTTPS 代理服务 → https://{settings.listen.host}:{settings.listen.port}")
     else:
-        logger.info(f"🔌 正在启动 HTTP 代理：http://{settings.listen.host}:{settings.listen.port}")
+        logger.info(f"🔌 启动 HTTP 代理服务 → http://{settings.listen.host}:{settings.listen.port}")
 
     uvicorn.run(
         app,
