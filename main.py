@@ -11,10 +11,11 @@ from typing import AsyncGenerator
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
-
 from lib.settings import Settings
 from lib.schemas import HealthCheckResponse
 from lib.logger import setup_logging
+from starlette.datastructures import Headers
+from urllib.parse import urlparse, urljoin
 
 # ======================
 # 加载配置 & 初始化日志
@@ -31,7 +32,6 @@ app = FastAPI()
 # 工具：流式传输 blob
 # ======================
 async def _stream_blob(url: str, original_headers: dict) -> AsyncGenerator[bytes, None]:
-    from urllib.parse import urlparse
     parsed_url = urlparse(url)
     host = parsed_url.hostname
     if not host:
@@ -95,6 +95,29 @@ async def handle_401_and_cache_realm(
     return Response(status_code=401, headers={"www-authenticate": new_www_auth})
 
 
+async def handle_request_headers(request_headers: Headers, host: str) -> dict[str, str]:
+    """
+    处理请求头：
+      - 替换 Host；
+      - 合并重复的 header 字段（用逗号连接）；
+      - 返回标准 dict[str, str] 格式的 headers。
+    """
+    header: dict[str, str] = {}
+
+    # 遍历所有原始头（包括重复键）
+    for key, value in request_headers.raw:
+        key_str = key.decode("latin-1").lower()  # HTTP 头不区分大小写，通常转小写处理
+        val_str = value.decode("latin-1")
+        if key_str not in header:
+            header[key_str] = val_str
+        else:
+            header[key_str] = f"{header[key_str]},{val_str}"
+    # 设置新的 Host 头
+    header["host"] = host
+    return header
+
+
+
 # ======================
 # 健康检查
 # ======================
@@ -137,11 +160,13 @@ async def auth_token(request: Request):
 
     async with httpx.AsyncClient() as client:
         try:
+            headers = await handle_request_headers(request.headers, upstream_host)
             resp = await client.get(
                 target_url,
-                headers={"User-Agent": request.headers.get("user-agent", "")}
+                headers=headers,
             )
             logger.info(f"✅ [认证] 上游服务返回状态码：{resp.status_code}")
+            resp.headers.pop("content-encoding", None)  # 移除 gzip 压缩头标识
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -169,10 +194,7 @@ async def proxy(path: str, request: Request):
     target_url = httpx.URL(upstream_base).join(full_path)
     upstream_host = target_url.host
 
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("cookie", None)
-    headers.pop("connection", None)
+    headers = await handle_request_headers(request.headers, upstream_host)
 
     logger.info(f"➡️ [代理] {request.method} {full_path} → {target_url}")
 
@@ -196,7 +218,10 @@ async def proxy(path: str, request: Request):
 
             # 处理 3xx 重定向
             if upstream_resp.status_code in (301, 302, 303, 307, 308):
+                logger.exception(f"响应头 {upstream_resp.headers}")
                 location = upstream_resp.headers.get("location")
+                location = urljoin(str(target_url), location)
+                logger.info(f"🔗 [代理] 解析后的重定向目标: {location}")
                 if location:
                     if "/blobs/" in full_path:
                         # Blob 重定向：流式代理
@@ -225,8 +250,7 @@ async def proxy(path: str, request: Request):
                                 )
                                 # 构造干净的响应头
                                 resp_headers = dict(cdn_resp.headers)
-                                resp_headers.pop("content-encoding", None)
-                                resp_headers.pop("transfer-encoding", None)
+
                                 # 返回实际内容，状态码改为 200
                                 return Response(
                                     content=cdn_resp.content,
@@ -239,8 +263,7 @@ async def proxy(path: str, request: Request):
 
             # 普通响应（非 401、非 3xx）
             resp_headers = dict(upstream_resp.headers)
-            resp_headers.pop("content-encoding", None)
-            resp_headers.pop("transfer-encoding", None)
+            resp_headers.pop("content-encoding", None)  # 移除 gzip 压缩头标识
 
             logger.debug(f"📡 [代理] 上游响应状态码：{upstream_resp.status_code}")
             return Response(

@@ -25,6 +25,7 @@
 | **Docker Hub** | `https://registry-1.docker.io`|
 | **Quay.io**   | `https://quay.io`|
 | **registry.k8s.io**| `https://registry.k8s.io`|
+| **gcr.io**| `https://gcr.io`|
 
 
 ---
