@@ -2,6 +2,9 @@ listen:
   host: "0.0.0.0"
   port: 443
 
+docs:
+  enable: false
+
 https:
   enable: true
   cert: "tls.crt"
@@ -10,5 +13,7 @@ https:
 upstreams:
   docker.xxx.com: "https://registry-1.docker.io"
   quay.xxx.com: "https://quay.io"
+  k8s.xxx.com: "https://registry.k8s.io"
+  gcr.xxx.com: "https://gcr.io"
 
 log_level: "INFO"

@@ -18,6 +18,8 @@ class ListenConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
 
+class DocsConfig(BaseModel):
+    enable: bool = False
 
 class HTTPSConfig(BaseModel):
     enable: bool = False
@@ -40,6 +42,7 @@ class HTTPSConfig(BaseModel):
 
 class Settings(BaseSettings):
     listen: ListenConfig = Field(default_factory=ListenConfig)
+    docs: DocsConfig = Field(default_factory=DocsConfig)
     https: HTTPSConfig = Field(default_factory=HTTPSConfig)
     upstreams: Dict[str, str] = Field(default_factory=..., description="Upstream registry mappings from config.yaml")
     log_level: str = "INFO"

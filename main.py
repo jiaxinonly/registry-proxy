@@ -36,7 +36,10 @@ REALM_CACHE: dict[str, str] = {}
 app = FastAPI(
     title="Registry Proxy",
     description="Docker Registry 反向代理网关，支持认证重写与 Blob 透明代理",
-    version="0.0.1"
+    version="0.0.1",
+    docs_url="/docs" if settings.docs.enable else None,
+    redoc_url="/redoc" if settings.docs.enable else None,
+    openapi_url="/openapi.json" if settings.docs.enable else None,
 )
 
 
@@ -346,7 +349,6 @@ if __name__ == "__main__":
     import uvicorn
 
     # 打印配置摘要
-
 
     logger.info("📚 已加载的上游注册表映射：")
     for domain, url in settings.upstreams.items():

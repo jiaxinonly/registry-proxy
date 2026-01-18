@@ -4,6 +4,7 @@
 
 > ✨ 特别适合按流量计费的低配服务器
 
+> ⚠️ **警告**：443端口容易被攻击请做好防火墙白名单限制！！！
 ---
 
 ## 🌟 功能特性
@@ -20,12 +21,12 @@
 
 本代理已验证支持以下主流 OCI 仓库：
 
-|仓库名称|上游地址|
-| ------------- | ---------------- |
-| **Docker Hub** | `https://registry-1.docker.io`|
-| **Quay.io**   | `https://quay.io`|
-| **registry.k8s.io**| `https://registry.k8s.io`|
-| **gcr.io**| `https://gcr.io`|
+| 仓库名称                |上游地址|
+|---------------------| ---------------- |
+| **Docker Hub**      | `https://registry-1.docker.io`|
+| **quay.io**         | `https://quay.io`|
+| **registry.k8s.io** | `https://registry.k8s.io`|
+| **gcr.io**          | `https://gcr.io`|
 
 
 ---
@@ -39,6 +40,15 @@ mv config.example.yaml config.yaml  # 自行修改域名或使用hosts、提供�
 pip install -r requirements.txt
 python main.py
 ```
+
+## 验证
+```bash
+podman pull docker.xxx.com/library/busybox:latest
+podman pull quay.xxx.com/quay/busybox:latest
+podman pull k8s.xxx.com/pause:latest
+podman pull gcr.xxx.com/google_containers/pause:latest
+```
+
 ## 相关项目
 [Docker-Proxy](https://github.com/dqzboy/Docker-Proxy)
 
