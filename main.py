@@ -37,9 +37,9 @@ app = FastAPI(
     title="Registry Proxy",
     description="Docker Registry 反向代理网关，支持认证重写与 Blob 透明代理",
     version="0.0.1",
-    docs_url="/docs" if settings.docs.enable else None,
-    redoc_url="/redoc" if settings.docs.enable else None,
-    openapi_url="/openapi.json" if settings.docs.enable else None,
+    docs_url="/docs" if settings.docs.enabled else None,
+    redoc_url="/redoc" if settings.docs.enabled else None,
+    openapi_url="/openapi.json" if settings.docs.enabled else None,
 )
 
 
@@ -139,7 +139,7 @@ async def handle_401_and_cache_realm(
 # ======================
 # 请求头处理：合并重复头 + 设置 Host
 # ======================
-async def handle_request_headers(request_headers: Headers, host: str) -> dict[str, str]:
+async def handle_headers(request_headers: Headers) -> dict[str, str]:
     """
     将 Starlette 的 Headers 转换为标准 dict，并：
     - 合并重复的 header（如多个 Cookie）→ 用逗号连接（符合 RFC）
@@ -151,8 +151,9 @@ async def handle_request_headers(request_headers: Headers, host: str) -> dict[st
     for key, value in request_headers.raw:
         key_str = key.decode("latin-1").lower()
         val_str = value.decode("latin-1")
-        if key_str == "host":
+        if key_str == "host" or key_str == "content-encoding":
             # 去除host让请求自动添加
+            # 去除content-encoding避免客户端二次解压，httpx底层在收到gzip等压缩头后会自动解压内容
             continue
         elif key_str in header_dict:
             header_dict[key_str] = f"{header_dict[key_str]},{val_str}"
@@ -184,15 +185,14 @@ async def auth_token(request: Request):
     3. 代理请求（保留 query 参数如 service/scope）
     4. 返回上游响应（移除 content-encoding 防止 FastAPI 二次压缩）
     """
-    host_header = request.headers.get("host", "")
-    proxy_domain = host_header.split(":")[0]
+    proxy_domain = request.headers.get("host", "")
 
     if proxy_domain not in settings.upstreams:
         logger.error(f"❓ [认证] 收到未知代理域名请求 → Host: {proxy_domain}")
         return Response(status_code=400, content="未知的 registry-proxy 域名")
 
-    upstream_base = settings.upstreams[proxy_domain]
-    upstream_host = httpx.URL(upstream_base).host
+    upstream_base_url = settings.upstreams[proxy_domain]
+    upstream_host = httpx.URL(upstream_base_url).host
 
     original_realm = REALM_CACHE.get(upstream_host)
     if not original_realm:
@@ -213,18 +213,16 @@ async def auth_token(request: Request):
 
     async with httpx.AsyncClient() as client:
         try:
-            headers = await handle_request_headers(request.headers, upstream_host)
+            headers = await handle_headers(request.headers)
             resp = await client.get(target_url, headers=headers, timeout=15.0)
 
-            # 移除 content-encoding，防止 FastAPI 误判为已压缩内容
-            clean_headers = dict(resp.headers)
-            clean_headers.pop("content-encoding", None)
-
+            resp_headers = await handle_headers(resp.headers)
             logger.info(f"✅ [认证] 上游返回状态码: {resp.status_code}")
+
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                headers=clean_headers
+                headers=resp_headers
             )
         except Exception as e:
             logger.exception("🚨 [认证] 代理请求失败 → 检查网络或上游服务可用性")
@@ -245,19 +243,19 @@ async def proxy(path: str, request: Request):
         - 否则 → 代取内容并返回 200（隐藏重定向）
     - 其他响应直接透传
     """
-    host_header = request.headers.get("host", "")
-    domain = host_header.split(":")[0]
+    # 获取域名判断代理到哪个仓库
+    proxy_domain = request.headers.get("host", "")
     full_path = f"/v2/{path}"
 
-    if domain not in settings.upstreams:
-        logger.warning(f"🌐 [代理] 收到未知域名请求 → Host: {domain}")
+    if proxy_domain not in settings.upstreams:
+        logger.warning(f"🌐 [代理] 收到未知域名请求 → Host: {proxy_domain}")
         return Response(status_code=400, content="未知的注册表域名")
 
-    upstream_base = settings.upstreams[domain]
-    target_url = httpx.URL(upstream_base).join(full_path)
+    upstream_base_url = settings.upstreams[proxy_domain]
+    target_url = httpx.URL(upstream_base_url).join(full_path)
     upstream_host = target_url.host
 
-    headers = await handle_request_headers(request.headers, upstream_host)
+    headers = await handle_headers(request.headers)
     logger.info(f"➡️ [代理] {request.method} {full_path} → {target_url}")
 
     async with httpx.AsyncClient() as client:
@@ -315,26 +313,24 @@ async def proxy(path: str, request: Request):
                                 headers=cdn_headers,
                                 timeout=30.0
                             )
-                            clean_headers = dict(cdn_resp.headers)
-                            clean_headers.pop("content-encoding", None)
+                            cdn_resp_headers = await handle_headers(cdn_resp.headers)
                             return Response(
                                 content=cdn_resp.content,
                                 status_code=200,  # 隐藏 3xx，返回 200
-                                headers=clean_headers
+                                headers=cdn_resp_headers
                             )
                         except Exception as e:
                             logger.exception(f"💥 [代理] 拉取重定向目标失败 → URL: {resolved_location}")
                             return Response(status_code=502, content="Failed to fetch redirected resource")
 
             # === 情况3: 普通响应（2xx/4xx/5xx）===
-            clean_headers = dict(upstream_resp.headers)
-            clean_headers.pop("content-encoding", None)  # 防止 FastAPI 二次解压
+            resp_headers = await handle_headers(upstream_resp.headers)
 
             logger.debug(f"📡 [代理] 上游响应 → Status: {upstream_resp.status_code}")
             return Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
-                headers=clean_headers
+                headers=resp_headers
             )
 
         except Exception as e:
@@ -351,11 +347,11 @@ if __name__ == "__main__":
     # 打印配置摘要
 
     logger.info("📚 已加载的上游注册表映射：")
-    for domain, url in settings.upstreams.items():
-        logger.info(f"  🌍 {domain} → {url}")
+    for proxy_domain, url in settings.upstreams.items():
+        logger.info(f"  🌍 {proxy_domain} → {url}")
 
     ssl_args = {}
-    if settings.https.enable:
+    if settings.https.enabled:
         if not settings.https.cert or not settings.https.key:
             raise ValueError("HTTPS 已启用，但配置中缺少 'cert' 或 'key'")
         ssl_args = {

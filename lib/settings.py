@@ -19,18 +19,18 @@ class ListenConfig(BaseModel):
     port: int = 8000
 
 class DocsConfig(BaseModel):
-    enable: bool = False
+    enabled: bool = False
 
 class HTTPSConfig(BaseModel):
-    enable: bool = False
+    enabled: bool = False
     cert: Optional[str] = None
     key: Optional[str] = None
 
     @model_validator(mode='after')
     def validate_cert_and_key_if_enabled(self):
-        if self.enable:
+        if self.enabled:
             if not self.cert or not self.key:
-                raise ValueError("'https.cert' and 'https.key' are required when 'https.enable' is true")
+                raise ValueError("'https.cert' and 'https.key' are required when 'https.enabled' is true")
             cert_path = Path(self.cert)
             key_path = Path(self.key)
             if not cert_path.exists():

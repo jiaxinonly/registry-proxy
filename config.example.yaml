@@ -3,10 +3,10 @@ listen:
   port: 443
 
 docs:
-  enable: false
+  enabled: false
 
 https:
-  enable: true
+  enabled: true
   cert: "tls.crt"
   key: "tls.key"
 
