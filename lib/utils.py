@@ -51,13 +51,12 @@ async def handle_headers(request_headers: Headers) -> dict[str, str]:
 # ======================
 async def handle_401_and_cache_realm(
         upstream_resp: httpx.Response,
-        upstream_host: str,
-        original_request: Request
+        request: Request
 ) -> Response:
     """
     处理来自上游注册表的 401 响应：
     1. 提取原始 realm
-    2. 缓存到 REALM_CACHE（按 upstream_host 索引）
+    2. 缓存到 REALM_CACHE
     3. 将 realm 重写为本地 /auth/token 路径
     4. 返回修改后的 401 响应给客户端
     """
@@ -67,18 +66,17 @@ async def handle_401_and_cache_realm(
         logger.warning("⚠️ [认证] WWW-Authenticate 头中未找到 realm 字段 → 跳过重写")
         return Response(status_code=401, headers={"www-authenticate": www_auth})
 
-    original_realm = match.group(1)
-    if upstream_host not in REALM_CACHE:
-        REALM_CACHE[upstream_host] = original_realm
-        logger.info(f"🔑 [认证] 首次缓存 upstream host '{upstream_host}' 的 realm: {original_realm}")
+    upstream_realm = match.group(1)
+    if upstream_resp.url.host not in REALM_CACHE:
+        REALM_CACHE[upstream_resp.url.host] = upstream_realm
+        logger.info(f"🔑 [认证] 首次缓存 upstream host '{upstream_resp.url.host}' 的 realm: {upstream_realm}")
 
     # 获取当前代理域名（用于构造新的 realm）
-    current_host = original_request.headers.get("host", "").split(":")[0]
-    new_realm = f"https://{current_host}/auth/token"
+    new_realm = f"https://{request.url.hostname}/auth/token"
 
     # 替换原始 realm 为本地 token 接口
-    new_www_auth = www_auth.replace(original_realm, new_realm)
-    logger.info(f"🔄 [认证] 成功重写 realm → 原始: {original_realm} → 新: {new_realm}")
+    new_www_auth = www_auth.replace(upstream_realm, new_realm)
+    logger.info(f"🔄 [认证] 成功重写 realm → 原始: {upstream_realm} → 新: {new_realm}")
 
     return Response(status_code=401, headers={"www-authenticate": new_www_auth})
 

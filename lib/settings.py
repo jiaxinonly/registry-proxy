@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, model_validator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import PydanticBaseSettingsSource
+from functools import lru_cache
 import yaml
 
 
@@ -80,3 +81,9 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="forbid",  # 禁止未定义字段
     )
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+
+settings = get_settings()

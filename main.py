@@ -15,7 +15,7 @@ Docker Registry 反向代理服务：
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
-from lib.settings import Settings
+from lib.settings import settings
 from lib.schemas import HealthCheckResponse
 from lib.logger import setup_logging
 from urllib.parse import urljoin
@@ -24,7 +24,6 @@ from lib.utils import REALM_CACHE, handle_headers, handle_401_and_cache_realm, s
 # ======================
 # 配置加载 & 日志初始化
 # ======================
-settings = Settings()
 logger = setup_logging(settings)  # 初始化结构化日志系统
 
 # 创建 FastAPI 应用实例
@@ -70,27 +69,25 @@ async def auth_token(request: Request):
     upstream_base_url = settings.upstreams[proxy_domain]
     upstream_host = httpx.URL(upstream_base_url).host
 
-    original_realm = REALM_CACHE.get(upstream_host)
-    if not original_realm:
+    upstream_realm = REALM_CACHE.get(upstream_host)
+    if not upstream_realm:
         logger.error(
             f"❓ [认证] realm 未就绪 → upstream_host: '{upstream_host}'。"
             "请先发起一次 /v2/ 请求以触发 401 并缓存 realm"
         )
         return Response(status_code=400, content="Realm 未就绪，请重试")
 
-    # 保留原始 query 参数（如 ?service=registry.docker.io&scope=...）
-    query = str(request.url.query)
-    target_url = original_realm
-    if query:
-        separator = "&" if "?" in original_realm else "?"
-        target_url += separator + query
+    upstream_full_url = upstream_realm
+    if request.url.query:
+        separator = "&" if "?" in upstream_realm else "?"
+        upstream_full_url += separator + request.url.query
 
-    logger.info(f"🔐 [认证] 代理请求至上游认证服务 → {target_url}")
+    logger.info(f"🔐 [认证] 代理请求至上游认证服务 → {upstream_full_url}")
 
     async with httpx.AsyncClient() as client:
         try:
             headers = await handle_headers(request.headers)
-            resp = await client.get(target_url, headers=headers, timeout=15.0)
+            resp = await client.get(upstream_full_url, headers=headers, timeout=15.0)
 
             resp_headers = await handle_headers(resp.headers)
             logger.info(f"✅ [认证] 上游返回状态码: {resp.status_code}")
@@ -109,7 +106,7 @@ async def auth_token(request: Request):
 # 主代理路由：/v2/{path}
 # ======================
 @app.api_route("/v2/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], summary="主代理入口")
-async def proxy(path: str, request: Request):
+async def proxy(request: Request):
     """
     核心代理逻辑：
     - 根据 Host 头路由到不同 upstream
@@ -120,25 +117,26 @@ async def proxy(path: str, request: Request):
     - 其他响应直接透传
     """
     # 获取域名判断代理到哪个仓库
-    proxy_domain = request.headers.get("host", "")
-    full_path = f"/v2/{path}"
+    proxy_domain = request.url.hostname
 
     if proxy_domain not in settings.upstreams:
         logger.warning(f"🌐 [代理] 收到未知域名请求 → Host: {proxy_domain}")
         return Response(status_code=400, content="未知的注册表域名")
 
     upstream_base_url = settings.upstreams[proxy_domain]
-    target_url = httpx.URL(upstream_base_url).join(full_path)
-    upstream_host = target_url.host
+    upstream_host = httpx.URL(upstream_base_url).host
+    upstream_full_url = upstream_base_url + request.url.path
+    if request.url.query:
+        upstream_full_url = upstream_full_url + "?" + request.url.query
 
     headers = await handle_headers(request.headers)
-    logger.info(f"➡️ [代理] {request.method} {full_path} → {target_url}")
+    logger.info(f"➡️ [代理] {request.method} {request.url} → {upstream_full_url}")
 
     async with httpx.AsyncClient() as client:
         try:
             upstream_resp = await client.request(
                 method=request.method,
-                url=target_url,
+                url=upstream_full_url,
                 headers=headers,
                 content=await request.body(),
                 timeout=30.0
@@ -150,7 +148,7 @@ async def proxy(path: str, request: Request):
                     and upstream_resp.headers.get("www-authenticate", "").lower().startswith("bearer ")
             ):
                 logger.info("🛡️ [代理] 拦截到 Bearer 认证请求 → 准备重写 realm")
-                return await handle_401_and_cache_realm(upstream_resp, upstream_host, request)
+                return await handle_401_and_cache_realm(upstream_resp, request)
 
             # === 情况2: 3xx 重定向 ===
             if upstream_resp.status_code in (301, 302, 303, 307, 308):
@@ -160,11 +158,11 @@ async def proxy(path: str, request: Request):
                     return Response(status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
                 # 解析绝对 URL（处理相对重定向）
-                resolved_location = urljoin(str(target_url), location)
+                resolved_location = urljoin(upstream_base_url, location)
                 logger.info(f"🔗 [代理] 原始重定向: {location} → 解析后: {resolved_location}")
 
                 # 判断是否为 blob 请求（关键！避免客户端直连 CDN）
-                if "/blobs/" in full_path:
+                if "/blobs/" in upstream_full_url:
                     logger.info("📦 [代理] 检测到 blob 重定向 → 启动流式代理")
                     return StreamingResponse(
                         stream_blob(resolved_location, headers),
@@ -174,19 +172,11 @@ async def proxy(path: str, request: Request):
                 else:
                     # Manifest 或 tag 列表等 → 代取内容，隐藏重定向
                     logger.info("🔄 [代理] 拦截非-blob 重定向 → 代取内容并返回 200")
-                    redirect_url = httpx.URL(resolved_location)
-                    redirect_host = redirect_url.host
-
-                    cdn_headers = {
-                        "Host": redirect_host,
-                        "User-Agent": headers.get("user-agent", "registry-proxy/0.0.1"),
-                    }
 
                     async with httpx.AsyncClient() as cdn_client:
                         try:
                             cdn_resp = await cdn_client.get(
                                 resolved_location,
-                                headers=cdn_headers,
                                 timeout=30.0
                             )
                             cdn_resp_headers = await handle_headers(cdn_resp.headers)
@@ -200,17 +190,33 @@ async def proxy(path: str, request: Request):
                             return Response(status_code=502, content="Failed to fetch redirected resource")
 
             # === 情况3: 普通响应（2xx/4xx/5xx）===
-            resp_headers = await handle_headers(upstream_resp.headers)
+            upstream_resp_headers = await handle_headers(upstream_resp.headers)
+
+            if upstream_resp.status_code == 202:
+                location = upstream_resp_headers.get("location")
+                try:
+                    new_location = location.replace(upstream_host, proxy_domain)
+                    logger.info(f"🔄 [代理] 重写 202 Location → {location} => {new_location}")
+                    upstream_resp_headers["location"] = new_location
+                    logger.info(upstream_resp_headers)
+
+                    return Response(
+                        content=upstream_resp.content,
+                        status_code=202,
+                        headers=upstream_resp_headers
+                    )
+                except Exception as e:
+                    logger.exception(f"⚠️ [代理] 重写 Location 失败: {e}")
 
             logger.debug(f"📡 [代理] 上游响应 → Status: {upstream_resp.status_code}")
             return Response(
                 content=upstream_resp.content,
                 status_code=upstream_resp.status_code,
-                headers=resp_headers
+                headers=upstream_resp_headers
             )
 
         except Exception as e:
-            logger.exception(f"🔥 [代理] 请求上游失败 → Target: {target_url}")
+            logger.exception(f"🔥 [代理] 请求上游失败 → Target: {upstream_full_url}")
             return Response(status_code=502, content="网关错误（Bad Gateway）")
 
 
