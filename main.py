@@ -151,7 +151,7 @@ async def proxy(request: Request):
                 return await handle_401_and_cache_realm(upstream_resp, request)
 
             # === 情况2: 3xx 重定向 ===
-            if upstream_resp.status_code in (301, 302, 303, 307, 308):
+            if upstream_resp.status_code in (302, 307):
                 location = upstream_resp.headers.get("location")
                 if not location:
                     logger.error("🔗 [代理] 3xx 响应缺少 Location 头 → 返回原响应")
