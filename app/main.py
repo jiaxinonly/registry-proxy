@@ -114,9 +114,9 @@ async def proxy(request: Request):
     - 处理 3xx 重定向：
         - 若路径含 /blobs/ → 流式代理（StreamingResponse）
         - 否则 → 代取内容并返回 200（隐藏重定向）
+    - 处理 202 Location 重写（用于 push 完成后跳转）
     - 其他响应直接透传
     """
-    # 获取域名判断代理到哪个仓库
     proxy_domain = request.url.hostname
 
     if proxy_domain not in settings.upstreams:
@@ -127,7 +127,7 @@ async def proxy(request: Request):
     upstream_host = httpx.URL(upstream_base_url).host
     upstream_full_url = upstream_base_url + request.url.path
     if request.url.query:
-        upstream_full_url = upstream_full_url + "?" + request.url.query
+        upstream_full_url += "?" + request.url.query
 
     headers = await handle_headers(request.headers)
     logger.info(f"➡️ [代理] {request.method} {request.url} → {upstream_full_url}")
@@ -174,9 +174,7 @@ async def proxy(request: Request):
                         media_type="application/octet-stream"
                     )
                 else:
-                    # Manifest 或 tag 列表等 → 代取内容，隐藏重定向
                     logger.info("🔄 [代理] 拦截非-blob 重定向 → 代取内容并返回 200")
-
                     async with httpx.AsyncClient() as cdn_client:
                         try:
                             cdn_resp = await cdn_client.get(
@@ -184,33 +182,37 @@ async def proxy(request: Request):
                                 timeout=30.0
                             )
                             cdn_resp_headers = await handle_headers(cdn_resp.headers)
+                            logger.info(f"✅ [代理] 成功代取重定向目标 → 返回 200")
                             return Response(
                                 content=cdn_resp.content,
-                                status_code=200,  # 隐藏 3xx，返回 200
+                                status_code=200,
                                 headers=cdn_resp_headers
                             )
                         except Exception as e:
                             logger.exception(f"💥 [代理] 拉取重定向目标失败 → URL: {resolved_location}")
                             return Response(status_code=502, content="Failed to fetch redirected resource")
 
-            # === 情况3: 普通响应（2xx/4xx/5xx）===
             upstream_resp_headers = await handle_headers(upstream_resp.headers)
-
+            # === 情况3: 202 Accepted===
             if upstream_resp.status_code == 202:
-                location = upstream_resp_headers.get("location")
-                try:
-                    new_location = location.replace(upstream_host, proxy_domain)
-                    logger.info(f"🔄 [代理] 重写 202 Location → {location} => {new_location}")
-                    upstream_resp_headers["location"] = new_location
+                location = upstream_resp.headers.get("location")
+                if location:
+                    try:
+                        new_location = location.replace(upstream_host, proxy_domain)
+                        logger.info(f"🔄 [代理] 重写 202 Location → {location} => {new_location}")
+                        upstream_resp_headers["location"] = new_location
 
-                    return Response(
-                        content=upstream_resp.content,
-                        status_code=202,
-                        headers=upstream_resp_headers
-                    )
-                except Exception as e:
-                    logger.exception(f"⚠️ [代理] 重写 Location 失败: {e}")
+                        return Response(
+                            content=upstream_resp.content,
+                            status_code=202,
+                            headers=upstream_resp_headers
+                        )
+                    except Exception as e:
+                        logger.exception(f"⚠️ [代理] 重写 Location 失败: {e}")
+                else:
+                    logger.warning("ℹ️ [代理] 202 响应无 Location 头，跳过重写")
 
+            # === 情况4: 普通响应（2xx/4xx/5xx）===
             logger.debug(f"📡 [代理] 上游响应 → Status: {upstream_resp.status_code}")
             return Response(
                 content=upstream_resp.content,
