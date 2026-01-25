@@ -1,6 +1,6 @@
 .venv
 .idea
 __pycache__/
-tls.crt
-tls.key
-config.yaml
+app/tls.crt
+app/tls.key
+app/config.yaml

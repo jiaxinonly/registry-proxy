@@ -19,7 +19,7 @@ from lib.settings import settings
 from lib.schemas import HealthCheckResponse
 from lib.logger import setup_logging
 from urllib.parse import urljoin
-from lib.utils import REALM_CACHE, handle_headers, handle_401_and_cache_realm, stream_blob
+from lib.utils import REALM_CACHE, handle_headers, handle_401_and_cache_realm, stream_download, stream_upload
 
 # ======================
 # 配置加载 & 日志初始化
@@ -134,13 +134,17 @@ async def proxy(request: Request):
 
     async with httpx.AsyncClient() as client:
         try:
-            upstream_resp = await client.request(
-                method=request.method,
-                url=upstream_full_url,
-                headers=headers,
-                content=await request.body(),
-                timeout=30.0
-            )
+            if request.method == "PATCH":
+                logger.info("📤 [代理] 检测到 blob 分块上传 → 启用流式上传")
+                upstream_resp = await stream_upload(upstream_full_url, headers, request)
+            else:
+                upstream_resp = await client.request(
+                    method=request.method,
+                    url=upstream_full_url,
+                    headers=headers,
+                    content=await request.body(),
+                    timeout=30.0
+                )
 
             # === 情况1: 401 认证响应 ===
             if (
@@ -165,7 +169,7 @@ async def proxy(request: Request):
                 if "/blobs/" in upstream_full_url:
                     logger.info("📦 [代理] 检测到 blob 重定向 → 启动流式代理")
                     return StreamingResponse(
-                        stream_blob(resolved_location, headers),
+                        stream_download(resolved_location),
                         status_code=200,
                         media_type="application/octet-stream"
                     )
@@ -198,7 +202,6 @@ async def proxy(request: Request):
                     new_location = location.replace(upstream_host, proxy_domain)
                     logger.info(f"🔄 [代理] 重写 202 Location → {location} => {new_location}")
                     upstream_resp_headers["location"] = new_location
-                    logger.info(upstream_resp_headers)
 
                     return Response(
                         content=upstream_resp.content,
@@ -227,7 +230,6 @@ if __name__ == "__main__":
     import uvicorn
 
     # 打印配置摘要
-
     logger.info("📚 已加载的上游注册表映射：")
     for proxy_domain, url in settings.upstreams.items():
         logger.info(f"  🌍 {proxy_domain} → {url}")

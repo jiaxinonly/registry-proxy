@@ -6,9 +6,8 @@
 @Time        : 00:22
 @Description : 
 """
-from lib.logger import get_logger
+from app.lib.logger import get_logger
 from typing import AsyncGenerator
-from urllib.parse import urlparse
 import httpx
 from fastapi import Request, Response
 from starlette.datastructures import Headers
@@ -84,7 +83,7 @@ async def handle_401_and_cache_realm(
 # ======================
 # 工具函数：流式代理 Blob 内容（用于处理 CDN 重定向）
 # ======================
-async def stream_blob(url: str, original_headers: dict) -> AsyncGenerator[bytes, None]:
+async def stream_download(url: str) -> AsyncGenerator[bytes, None]:
     """
     从给定 URL 流式拉取二进制内容（如 layer/blob），并透传给客户端。
 
@@ -92,27 +91,13 @@ async def stream_blob(url: str, original_headers: dict) -> AsyncGenerator[bytes,
     - 不跟随重定向（由调用方确保 url 是最终 CDN 地址）
     - 使用 Host 头欺骗以绕过 CDN 的 Host 校验
     """
-    parsed_url = urlparse(url)
-    host = parsed_url.hostname
-    if not host:
-        error_msg = f"无效的重定向 URL：缺少主机名 | URL={url}"
-        logger.error(f"❌ [BLOB代理] {error_msg}")
-        raise ValueError(error_msg)
-
-    # 构造请求头：关键是要设置正确的 Host 和 User-Agent
-    cdn_headers = {
-        "Host": host,
-        "User-Agent": original_headers.get("user-agent", "registry-proxy/0.0.1"),
-    }
-
-    logger.info(f"📥 [BLOB代理] 开始流式拉取资源 → URL: {url} | Host: {host}")
+    logger.info(f"📥 [BLOB代理] 开始流式拉取资源 → URL: {url}")
 
     async with httpx.AsyncClient() as client:
         try:
             async with client.stream(
                     method="GET",
                     url=url,
-                    headers=cdn_headers,
                     follow_redirects=False,  # 不再重定向（应已是最终地址）
                     timeout=60.0
             ) as resp:
@@ -134,4 +119,36 @@ async def stream_blob(url: str, original_headers: dict) -> AsyncGenerator[bytes,
 
         except Exception as e:
             logger.exception(f"💥 [BLOB代理] 流式传输失败 → URL: {url} | 错误: {e}")
+            raise
+
+
+# ======================
+# 工具函数：流式代理上传（用于处理分块上传 PATCH）
+# ======================
+async def stream_upload(
+        url: str,
+        headers: dict,
+        request: Request
+) -> httpx.Response:
+    """
+    流式转发客户端的 PATCH 上传请求到 upstream，避免将整个 body 加载进内存。
+    """
+    logger.info(f"📤 [UPLOAD代理] 开始流式上传 → URL: {url}")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # 使用 stream=True + aiter_bytes 转发 body
+            async def _body_stream():
+                async for chunk in request.stream():
+                    yield chunk
+
+            resp = await client.patch(
+                url=url,
+                headers=headers,
+                content=_body_stream(),
+                timeout=60.0  # 上传可能较慢，延长超时
+            )
+            return resp
+        except Exception as e:
+            logger.exception(f"💥 [UPLOAD代理] 流式上传失败 → URL: {url} | 错误: {e}")
             raise
