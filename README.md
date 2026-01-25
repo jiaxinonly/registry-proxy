@@ -33,12 +33,30 @@
 
 ## 🛠️ 快速开始
 
+### 源码启动
+
 ```bash
 git clone https://github.com/jiaxinonly/registry-proxy.git
 cd registry-proxy
 mv config.example.yaml config.yaml  # 自行修改域名或使用hosts、提供证书
 pip install -r requirements.txt
 python main.py
+```
+
+### 容器运行
+
+确保你已准备好配置文件 `config.yaml`（参考 `config.example.yaml`）和 TLS 证书（如启用 HTTPS）。
+
+```bash
+# 示例：挂载配置与证书，映射 443 端口
+docker run -d \
+  --name registry-proxy \
+  -p 443:443 \
+  -v  $ (pwd)/config.yaml:/app/config.yaml \
+  -v  $ (pwd)/tls.crt:/app/tls.crt \
+  -v  $ (pwd)/tls.key:/app/tls.key \
+  --restart unless-stopped \
+  docker.io/jiaxinonly/registry-proxy:latest
 ```
 
 ## 验证
