@@ -7,7 +7,7 @@
 @Description :
 """
 import logging
-from .settings import Settings
+from lib.settings import Settings
 
 
 def setup_logging(settings: Settings):

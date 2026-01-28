@@ -12,7 +12,7 @@
 - 流式上传代理
 """
 
-from app.lib.logger import get_logger
+from lib.logger import get_logger
 from typing import AsyncGenerator
 import httpx
 from fastapi import Request, Response
