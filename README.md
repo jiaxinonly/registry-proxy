@@ -52,9 +52,9 @@ python main.py
 docker run -d \
   --name registry-proxy \
   -p 443:443 \
-  -v  $ (pwd)/config.yaml:/app/config.yaml \
-  -v  $ (pwd)/tls.crt:/app/tls.crt \
-  -v  $ (pwd)/tls.key:/app/tls.key \
+  -v  $(pwd)/config.yaml:/app/config.yaml \
+  -v  $(pwd)/tls.crt:/app/tls.crt \
+  -v  $(pwd)/tls.key:/app/tls.key \
   --restart unless-stopped \
   docker.io/jiaxinonly/registry-proxy:latest
 ```
