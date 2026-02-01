@@ -44,7 +44,7 @@ async def handle_headers(request_headers: Headers) -> dict[str, str]:
         val_str = value.decode("latin-1")
 
         # 忽略 Host 和 Content-Encoding（httpx 自动设置 Host；避免重复解压）
-        if key_str in ("host", "content-encoding"):
+        if key_str in ("host", "content-encoding", "content-length"):
             continue
 
         if key_str in header_dict:
